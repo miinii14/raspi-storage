@@ -1,0 +1,9 @@
+bin
+obj
+.env*
+logs
+.git
+test*
+docker-compose.yml
+server
+*.bin

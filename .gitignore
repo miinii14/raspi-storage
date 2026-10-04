@@ -1,0 +1,9 @@
+bin/
+obj/
+
+logs/
+
+.env
+server/
+
+test-files/
