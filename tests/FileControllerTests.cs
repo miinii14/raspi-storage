@@ -111,6 +111,15 @@ public class FileControllerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task UploadFile_WithoutFile_ReturnsBadRequest()
+    {
+        var response = await _client.PostAsync("/api/files", new MultipartFormDataContent { { new StringContent("not a file"), "description" } });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+    }
+
+    [Fact]
     public async Task UploadFile_WithFolderId_ReturnsCreated()
     {
         var folder = await CreateFolderAsync("test-folder");
