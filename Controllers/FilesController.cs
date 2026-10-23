@@ -39,11 +39,11 @@ public class FilesController : ControllerBase
     [HttpPost]
     [RequestSizeLimit(1000000000)]
     [RequestFormLimits(MultipartBodyLengthLimit = 1000000000)]
-    public async Task<IActionResult> Upload(IFormFile file, [FromQuery] Guid? folderId)
+    public async Task<IActionResult> Upload(IFormFile? file, [FromQuery] Guid? folderId) //IFormFile? is intended for ExceptionHandling
     {
         var ownerId = GetCurrentUser().Id;
         if (file is null)
-            return BadRequest("File is empty");
+            return Problem(detail: "File is empty", statusCode: 400);
 
         var uploadedFile = await _fileService.UploadAsync(file.OpenReadStream(), file.FileName, folderId, ownerId, file.Length, file.ContentType);
         return CreatedAtAction(nameof(GetById), new { id = uploadedFile.Id }, uploadedFile);

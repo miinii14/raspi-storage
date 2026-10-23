@@ -18,8 +18,7 @@ public class UserResolutionMiddleware
 
         if (clientCertificate == null)
         {
-            context.Response.StatusCode = 401;
-            await context.Response.WriteAsync("Missing client certificate");
+            await Results.Problem(detail: "Missing client certificate", statusCode: 401).ExecuteAsync(context);
             return;
         }
 
@@ -27,8 +26,7 @@ public class UserResolutionMiddleware
 
         if (string.IsNullOrEmpty(cn))
         {
-            context.Response.StatusCode = 401;
-            await context.Response.WriteAsync("Missing client certificate CN");
+            await Results.Problem(detail: "Missing client certificate CN", statusCode: 401).ExecuteAsync(context);
             return;
         }
 
@@ -36,8 +34,7 @@ public class UserResolutionMiddleware
 
         if (user is null)
         {
-            context.Response.StatusCode = 401;
-            await context.Response.WriteAsync($"User '{cn}' not found");
+            await Results.Problem(detail: $"User '{cn}' not found", statusCode: 401).ExecuteAsync(context);
             return;
         }
 

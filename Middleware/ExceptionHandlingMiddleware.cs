@@ -1,5 +1,4 @@
 using System.Net;
-using System.Text.Json;
 using Npgsql;
 using RaspiStorage.Exceptions;
 
@@ -52,9 +51,6 @@ public class ExceptionHandlingMiddleware
             _ => HttpStatusCode.InternalServerError
         };
 
-        context.Response.ContentType = "application/json";
-        context.Response.StatusCode = (int)statusCode;
-
         var response = ex switch
         {
             NotFoundException or ConflictException or QuotaExceededException or InvalidNameException => ex.Message,
@@ -63,6 +59,6 @@ public class ExceptionHandlingMiddleware
             _ => "An unexpected error occurred"
         };
 
-        await context.Response.WriteAsync(JsonSerializer.Serialize(response));
+        await Results.Problem(detail: response, statusCode: (int)statusCode).ExecuteAsync(context);
     }
 }
