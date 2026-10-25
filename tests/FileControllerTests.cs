@@ -74,7 +74,7 @@ public class FileControllerTests : IAsyncLifetime
 
         var response = await _client.PostAsync("/api/files", FileForm("test.txt", UniqueContent()));
 
-        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(HttpStatusCode.InsufficientStorage, response.StatusCode);
         Assert.Equal(0, await GetUsedBytesAsync(_dbConnection));
         Assert.Empty(Directory.GetFiles(TestConstants.TestStoragePath));
     }
