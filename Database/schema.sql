@@ -17,6 +17,26 @@ CREATE TABLE folders (
 CREATE UNIQUE INDEX folders_unique_name_per_parent
 ON folders (owner_id, COALESCE(parent_id, '00000000-0000-0000-0000-000000000000'::uuid), name);
 
+CREATE FUNCTION folder_name_not_taken_by_file() RETURNS trigger AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM files
+        WHERE owner_id = NEW.owner_id
+          AND folder_id IS NOT DISTINCT FROM NEW.parent_id
+          AND name = NEW.name
+    ) THEN
+        RAISE EXCEPTION 'File named ''%'' already exists in this location', NEW.name
+            USING ERRCODE = 'unique_violation';
+END IF;
+
+RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER folders_name_check
+    BEFORE INSERT OR UPDATE OF name, parent_id ON folders
+    FOR EACH ROW EXECUTE FUNCTION folder_name_not_taken_by_file();
+
 CREATE TABLE files (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -30,6 +50,26 @@ CREATE TABLE files (
 );
 CREATE UNIQUE INDEX files_unique_name_per_folder
 ON files (owner_id, COALESCE(folder_id, '00000000-0000-0000-0000-000000000000'::uuid), name);
+
+CREATE FUNCTION file_name_not_taken_by_folder() RETURNS trigger AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM folders
+        WHERE owner_id = NEW.owner_id
+          AND parent_id IS NOT DISTINCT FROM NEW.folder_id
+          AND name = NEW.name
+    ) THEN
+        RAISE EXCEPTION 'Folder named ''%'' already exists in this location', NEW.name
+            USING ERRCODE = 'unique_violation';
+END IF;
+
+RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER files_name_check
+    BEFORE INSERT OR UPDATE OF name, folder_id ON files
+    FOR EACH ROW EXECUTE FUNCTION file_name_not_taken_by_folder();
 
 CREATE TABLE activity (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

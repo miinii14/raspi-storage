@@ -2,39 +2,34 @@
 
 **A self-hosted alternative to cloud storage that runs on a Raspberry Pi 5.**
 
-Raspi Storage is a custom file storage service hosted on a Raspberry Pi 5. Its purpose is to store files securely and give access to them from any device.
+Raspi Storage is a file storage service with a REST API, hosted on a Raspberry Pi 5. Its purpose is to store files securely and give access to them from any device.
 
-There are no passwords and no login. A client can access files only with a valid certificate signed by the server's certificate authority. Any other client is refused during the TLS handshake, before a single byte reaches the application.
+There are no passwords and no login. A client can access files only with a valid certificate signed by the server's certificate authority. Requests without one are answered by nginx and never reach the application.
 
 I built it to keep my own files at home instead of with a cloud provider. The aim was a small backend that stays **correct under failure**: quota, database and disk must never drift apart, even if a request dies halfway through.
 
 ---
 
-## Table of contents
+## Client
 
-- [Features](#features)
-- [Architecture](#architecture)
-- [Design decisions](#design-decisions)
-- [Tests](#tests)
-- [Tech stack](#tech-stack)
-- [Project structure](#project-structure)
-- [Getting started](#getting-started)
-- [API](#api)
+The main client is [**rs**](https://github.com/miinii14/raspi-storage-cli), an interactive terminal shell for this API: `cd`, `ls`, `tree`, `mv`, upload and download with a progress bar.
+
+![rs demo](https://github.com/miinii14/raspi-storage-cli/raw/master/docs/demo.gif)
 
 ---
 
 ## Features
 
-- 📁 **Files**: upload (up to 1 GB), download, rename, move, delete
-- 🗂️ **Nested folders**: create, rename, move, and delete a whole subtree in one call
-- 📊 **Per-user quota**: every upload and delete updates the user's used bytes atomically
-- 🔐 **Certificate-based auth**: the user is identified by the certificate's Common Name, with no passwords and no tokens
-- 📝 **Activity log**: a per-user history of uploads, downloads, renames, moves and deletes
-- 🛡️ **Input validation and clean errors**: consistent `400 / 401 / 404 / 409` responses, and a generic `500` that never leaks internals
+- **Files**: upload (up to 1 GB), download, rename, move, delete
+- **Nested folders**: create, rename, move, and delete a whole subtree in one call
+- **Per-user quota**: every upload and delete updates the user's used bytes atomically
+- **Certificate-based auth**: the user is identified by the certificate's Common Name, with no passwords and no tokens
+- **Activity log**: a per-user history of uploads, downloads, renames, moves and deletes
+- **One error format**: every error is RFC 7807 `problem+json` with a machine-readable `code`, and a `500` never leaks internals
 
 ---
 
-## Architecture
+## How it works
 
 ```mermaid
 flowchart LR
@@ -44,19 +39,17 @@ flowchart LR
     A -- "file contents<br/>stored under GUID names" --> D[(Disk<br/>/storage/files)]
 ```
 
-1. **nginx** terminates TLS. It requires a client certificate (`ssl_verify_client on`) and checks it against the private CA. If the certificate is missing or invalid, the connection is rejected right there.
+1. **nginx** terminates TLS and requires a client certificate (`ssl_verify_client on`), checked against the private CA. A missing or invalid certificate gets a `403` with a `problem+json` body from nginx itself. The request is never forwarded.
 2. nginx forwards the verified certificate to the API in the `X-Client-Cert` header. ASP.NET Core's certificate forwarding turns the header back into an `X509Certificate2`.
 3. A middleware reads the certificate's **Common Name** and looks up the user with that username. An unknown CN gets `401`.
 4. **PostgreSQL** holds the metadata: users, quotas, the folder tree, file records and the activity log.
 5. **File contents** are written to disk under random GUID names. The human-readable name and the folder structure exist only in the database.
 
-**Network exposure:** port `443` is the only port open to the network. The API container has no published port and is reachable only through nginx. Postgres is published on `127.0.0.1` only, for local maintenance from the Pi itself.
+Port `443` is the only port open to the network. The API container has no published port and is reachable only through nginx. Postgres is published on `127.0.0.1` only, for local maintenance from the Pi itself.
 
 ---
 
 ## Design decisions
-
-These are the parts I spent the most time on. Each one fixes a concrete way the system could break.
 
 **Database and disk stay consistent.**
 An upload writes the file to disk first. It then inserts the record, updates the quota and writes the activity entry in **one transaction**. If any step fails, the transaction rolls back and the file is deleted from disk, so no orphaned files are left behind. Deletes run in the reverse order: the database transaction commits first, then the file is removed from disk. A record whose file is already missing can still be deleted.
@@ -73,26 +66,31 @@ Inside one transaction, the service collects every file in the subtree. It then 
 **The activity log survives deletion.**
 Activity rows keep the target's id and name but have **no foreign key** to files or folders. A "deleted folder X" entry stays readable after X is gone. Uploads and deletes are logged in the same transaction as the action itself.
 
-**Duplicate names are prevented by the database.**
-Unique indexes on `(owner, parent folder, name)` enforce unique names per folder. Because of `COALESCE` on the parent id, this also works at the root level, where the parent is `NULL`. The resulting Postgres error `23505` is turned into a readable `409 Conflict`.
+**Names are unique per folder, across files and folders.**
+A path like `/docs/report` must point to exactly one thing, so a file and a folder cannot share a name in the same folder. Inside one table, unique indexes on `(owner, parent folder, name)` enforce this; `COALESCE` on the parent id makes it work at the root level too, where the parent is `NULL`. An index cannot span two tables, so a `BEFORE INSERT OR UPDATE` trigger on each table checks the other one. All of these raise Postgres error `23505`, which the API turns into `409 Conflict`. The rule lives in the database, so no code path can skip it.
 
 **Names are validated in one place.**
 One rule set is reused by a custom `[ValidName]` attribute on the request DTOs and by the upload path, which has no DTO. A name must not be empty, must be at most 255 characters and must not have leading or trailing whitespace. `.`, `..`, `/`, `\` and control characters are not allowed.
 
 **Errors are predictable and nothing leaks.**
-A global exception middleware maps domain exceptions and specific Postgres errors to `400 / 404 / 409`. Any other exception is logged with its full stack trace and returned as a generic `500`. It also handles two edge cases: a client that aborts the request (logged as info, no response) and a response that has already started.
-
-**Large uploads go straight through the proxy.**
-nginx allows bodies up to 1 GB and has request buffering turned off (`proxy_request_buffering off`). An upload is passed straight to the API instead of being written to nginx's disk first.
+A global exception middleware maps domain exceptions and specific Postgres errors to `400 / 404 / 409 / 507` and returns them as `problem+json` with a `code` and a `traceId`. nginx returns its own certificate errors in the same format, so a client parses one shape everywhere. Any other exception is logged with its full stack trace and returned as a generic `500`. Two edge cases are handled too: a client that aborts the request (logged as info, no response) and a response that has already started.
 
 **Least privilege.**
 The API container runs as an unprivileged user (`1000:1000`). nginx gets only the CA **certificate**. The CA **private key** never touches the server, so a compromised server cannot issue new client certificates.
 
 ---
 
+## Known limitations
+
+- **Upload checks run after the transfer.** nginx streams uploads to the API (`proxy_request_buffering off`), but ASP.NET's `IFormFile` binding buffers the whole body before the controller runs. A duplicate name or a full quota is detected only after the file has been received and written. The fix is to read the multipart body with `MultipartReader` and check before streaming to disk.
+- **The file/folder name trigger takes no lock.** Two requests that create a file and a folder with the same name at the same moment can both succeed. Same-table duplicates are still fully protected by the unique indexes.
+- **Request validation errors use ASP.NET's default shape.** For invalid request bodies, the reason is in the `errors` field, `detail` is empty and there is no `code`.
+
+---
+
 ## Tests
 
-The suite has **62 integration tests**, and nothing is mocked:
+63 integration tests, run with `dotnet test tests`. Nothing is mocked:
 
 - The whole application runs in memory through `WebApplicationFactory`, with the real middleware pipeline, controllers, services and SQL.
 - **Testcontainers** starts a disposable PostgreSQL 16 container and applies the same `Database/schema.sql` that production uses.
@@ -100,44 +98,7 @@ The suite has **62 integration tests**, and nothing is mocked:
 
 Covered areas: requests without a certificate, upload/download round-trips, quota limits and quota refunds on delete, duplicate names, name validation, folder-cycle protection, recursive folder deletion (subfolders, files on disk, quota, activity entry), and deleting a record whose file is already missing on disk.
 
-To run them (Docker must be running, because the tests start a real PostgreSQL container):
-
-```bash
-dotnet test tests
-```
-
----
-
-## Tech stack
-
-| Layer | Technology |
-|---|---|
-| API | .NET 10, ASP.NET Core (controllers + custom middleware) |
-| Data access | Dapper over Npgsql with hand-written SQL |
-| Database | PostgreSQL 16 |
-| Reverse proxy / TLS | nginx with mutual TLS |
-| Deployment | Docker Compose on Raspberry Pi 5 (ARM64) |
-| Logging | Serilog (console + daily rolling file) |
-| Testing | xUnit, `WebApplicationFactory`, Testcontainers (real PostgreSQL) |
-
----
-
-## Project structure
-
-```
-├── Controllers/     HTTP endpoints for files, folders, activity
-├── Services/        Business logic: transactions, quota, cycle checks, tree delete
-├── Data/            Dapper repositories and connection factory
-├── Middleware/      Certificate → user resolution, global exception handling
-├── DTOs/            Request/response contracts and the [ValidName] attribute
-├── Models/          Database entities and options
-├── Exceptions/      Domain exceptions mapped to HTTP status codes
-├── Database/        schema.sql: tables, constraints, indexes, seed user
-├── nginx/           nginx.conf with mutual TLS and proxy settings
-├── tests/           xUnit integration tests (Testcontainers)
-├── Dockerfile       Multi-stage build (SDK → ASP.NET runtime)
-└── docker-compose.yml
-```
+Docker must be running, because the tests start a real PostgreSQL container.
 
 ---
 
@@ -189,13 +150,13 @@ openssl pkcs12 -export -inkey client.key -in client.crt -certfile ca.crt -out cl
 - **`SERVER_SAN`** lists every address clients use to reach the server. Use the `DNS:` prefix for names and `IP:` for addresses. The client checks the address it connects to against this list, so a missing entry fails with a certificate error.
 - **`CLIENT_USER`** becomes the certificate's Common Name and must equal a `username` in the `users` table.
 
-**Access from outside your network (port forwarding).** Forward an external port on your router to port `443` of the server, and add the public address to `SERVER_SAN`. A dynamic DNS name is better than a public IP, because home IPs change:
+**Access from outside your network.** Forward an external port on your router to port `443` of the server, and add the public address to `SERVER_SAN`. A dynamic DNS name is better than a public IP, because home IPs change:
 
 ```bash
 SERVER_SAN="DNS:<server-hostname>,IP:<server-lan-ip>,DNS:<your-ddns-domain>"
 ```
 
-If you change the addresses later, issue a new server certificate with the same CA. Client certificates stay valid. Opening the port is reasonably safe here: nginx drops every connection without a client certificate signed by your CA, during the TLS handshake.
+If you change the addresses later, issue a new server certificate with the same CA. Client certificates stay valid. Opening the port is reasonably safe here: nginx refuses every request without a client certificate signed by your CA.
 
 Copy only these three files into `./server/` (git-ignored):
 
@@ -216,11 +177,11 @@ sudo chown -R 1000:1000 /storage/files
 mkdir -p logs && sudo chown 1000:1000 logs
 ```
 
-> If a bind-mounted directory does not exist, Docker creates it **owned by root**. Uploads then fail with `500` (access denied). If your user's uid is not 1000 (check with `id`), change `user:` in `docker-compose.yml`.
+If a bind-mounted directory does not exist, Docker creates it **owned by root**, and uploads then fail with `500` (access denied). If your user's uid is not 1000 (check with `id`), change `user:` in `docker-compose.yml`.
 
 ### 4. Users
 
-The last line of `Database/schema.sql` seeds one user, `test-user`, with a 10 GB quota. Before the first start, change `test-user` to the CN of your client certificate. **A user is a row in `users` plus a client certificate whose CN matches its `username`.**
+The last line of `Database/schema.sql` seeds one user, `test-user`, with a 10 GB quota. Before the first start, change `test-user` to the CN of your client certificate. A user is a row in `users` plus a client certificate whose CN matches its `username`.
 
 ### 5. Run
 
@@ -232,7 +193,7 @@ The API is now available at `https://<server-address>/api/...` to clients that p
 
 Logs go to the console (`docker compose logs -f api`) and to `./logs/app.log`, with a new file every day. Every request is logged with its method, path, status and duration. Unhandled exceptions are logged with their full stack trace.
 
-> `schema.sql` runs **only when the database volume is first created**. After changing the schema, recreate the volume with `docker compose down -v`. ⚠️ This erases all stored metadata.
+`schema.sql` runs **only when the database volume is first created**. After changing the schema, either apply the change by hand with `docker compose exec db psql`, or recreate the volume with `docker compose down -v`, which erases all stored metadata.
 
 ---
 
@@ -284,14 +245,67 @@ curl --cert client.crt --key client.key --cacert ca.crt \
   https://<server-address>/api/folders
 ```
 
-### Error responses
+### Errors
 
-| Status | When |
+Every error is `application/problem+json`:
+
+```json
+{
+  "title": "Conflict",
+  "status": 409,
+  "detail": "Folder named 'Photos' already exists in this location",
+  "code": "conflict",
+  "traceId": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"
+}
+```
+
+| Status | `code` | When |
+|---|---|---|
+| `400` | `invalid_name`, `value_too_long` | Invalid file name on upload, value too long for the database |
+| `400` | – | Invalid request body (reason in `errors`), missing file in an upload |
+| `400` | `https_required` | Plain HTTP sent to the HTTPS port (nginx) |
+| `401` | – | Certificate has no CN, or no user matches the CN |
+| `403` | `cert_missing`, `cert_invalid` | No client certificate, or one not signed by the CA (nginx) |
+| `404` | `not_found` | File or folder does not exist **or belongs to another user** |
+| `409` | `conflict`, `duplicate` | Name already taken in that folder, or folder moved into its own subtree |
+| `507` | `quota_exceeded` | Upload does not fit into the user's quota |
+| `500` | `internal_error` | Unexpected error (details only in the server log) |
+
+---
+
+## Tech stack
+
+| Area | Technology |
 |---|---|
-| `400` | Invalid name, value too long, quota exceeded, missing file |
-| `401` | Certificate has no CN, or no user matches the CN |
-| `404` | File or folder does not exist **or belongs to another user** |
-| `409` | Name already taken in that folder, or folder moved into its own subtree |
-| `500` | Unexpected error (details only in the server log) |
+| API | .NET 10, ASP.NET Core (controllers + custom middleware) |
+| Data access | Dapper over Npgsql with hand-written SQL |
+| Database | PostgreSQL 16 (constraints, unique indexes, triggers) |
+| Reverse proxy / TLS | nginx with mutual TLS |
+| Deployment | Docker Compose on Raspberry Pi 5 (ARM64) |
+| Logging | Serilog (console + daily rolling file) |
+| Testing | xUnit, `WebApplicationFactory`, Testcontainers (real PostgreSQL) |
 
-Requests without a valid certificate never reach the API. nginx rejects them during the TLS handshake.
+---
+
+## Project structure
+
+```
+├── Controllers/        HTTP endpoints for files, folders, activity
+├── Services/           Business logic: transactions, quota, cycle checks, tree delete
+├── Data/               Dapper repositories and connection factory
+├── Middleware/         Certificate → user resolution, global exception handling
+├── DTOs/               Request/response contracts and the [ValidName] attribute
+├── Models/             Database entities and options
+├── Exceptions/         Domain exceptions mapped to HTTP status codes
+├── Database/           schema.sql: tables, constraints, indexes, triggers, seed user
+├── nginx/              nginx.conf with mutual TLS, proxy settings, problem+json error pages
+├── tests/              xUnit integration tests (Testcontainers)
+├── Dockerfile          Multi-stage build (SDK → ASP.NET runtime)
+└── docker-compose.yml
+```
+
+---
+
+## License
+
+[MIT](LICENSE)

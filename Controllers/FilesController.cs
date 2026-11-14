@@ -54,7 +54,7 @@ public class FilesController : ControllerBase
     {
         var ownerId = GetCurrentUser().Id;
         var (stream, mimeType, fileName) = await _fileService.DownloadAsync(id, ownerId);
-        return File(stream, mimeType ?? "application/octet-stream", fileName);
+        return File(stream, string.IsNullOrEmpty(mimeType) ? "application/octet-stream" : mimeType, fileName);
     }
 
     [HttpDelete("{id}")]
